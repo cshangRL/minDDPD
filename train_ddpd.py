@@ -483,8 +483,8 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
 
 @click.command()
 @click.option('--batch-size', default=32, help='Batch size per GPU')
-@click.option('--planner-lr', default=1e-3, help='Planner learning rate')
-@click.option('--denoiser-lr', default=1e-3, help='Denoiser learning rate')
+@click.option('--planner-lr', default=2e-4, help='Planner learning rate')
+@click.option('--denoiser-lr', default=2e-4, help='Denoiser learning rate')
 @click.option('--weight-decay', default=0.1, help='Weight decay')
 @click.option('--max-iters', default=2000, help='Maximum iterations')
 @click.option('--warmup-iters', default=100, help='Warmup iterations')
