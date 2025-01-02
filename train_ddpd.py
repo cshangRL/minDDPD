@@ -27,6 +27,7 @@ class DDPDConfig:
     qk_layernorm: bool = True
     timesteps: int = 1000
     max_t: float = 0.98
+    num_classes: int = 1000  # Number of ImageNet classes
 
 class ImageTokenDataset(Dataset):
     def __init__(self, safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors", debug=False):
@@ -68,9 +69,8 @@ class ImageTokenDataset(Dataset):
         try:
             # Get indices and reshape to 1D
             indices = self.indices[idx].reshape(-1)
-            # Replace randomly with mask token (67999)
-            indices = indices.masked_fill_(torch.rand((indices.shape)) < 0.05, 67999)
-            return indices
+            label = self.labels[idx]
+            return indices, label
         except Exception as e:
             print(f"Error in __getitem__ for idx {idx}: {e}")
             raise
@@ -217,6 +217,7 @@ class DDPDPlanner(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            wce = nn.Embedding(config.num_classes, config.n_embd),  # Class embedding
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
@@ -238,16 +239,17 @@ class DDPDPlanner(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, time, targets=None):
+    def forward(self, idx, time, class_labels, targets=None):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
         
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
+        class_emb = self.transformer.wce(class_labels).unsqueeze(1).expand(-1, t, -1)  # Expand class embedding to all positions
         
         time_emb = self._get_time_embedding(time, self.config.n_embd)
         
-        x = self.transformer.drop(tok_emb + pos_emb + time_emb.unsqueeze(1))
+        x = self.transformer.drop(tok_emb + pos_emb + class_emb + time_emb.unsqueeze(1))
         freq = self.rotary(None, height_width=(32, 32))
         for block in self.transformer.h:
             x = block(x, freq)
@@ -272,7 +274,7 @@ class DDPDPlanner(nn.Module):
         return emb
 
     @torch.no_grad()
-    def sample(self, denoiser, batch_size=1, sequence_length=128, temperature=1.0, top_k=None, device='cuda'):
+    def sample(self, denoiser, class_labels=None, batch_size=1, sequence_length=128, temperature=1.0, top_k=None, device='cuda'):
         x = torch.full(
             (batch_size, sequence_length), 
             self.config.vocab_size - 1, 
@@ -280,18 +282,21 @@ class DDPDPlanner(nn.Module):
             device=device
         )
         
+        if class_labels is None:
+            class_labels = torch.randint(0, self.config.num_classes, (batch_size,), device=device)
+        
         time_steps = torch.linspace(0.98, 0.02, 50, device=device)
         
         for t in time_steps:
             current_t = torch.full((batch_size,), t, device=device)
             
-            planner_logits = self(x, current_t)
+            planner_logits = self(x, current_t, class_labels)
             planner_probs = torch.sigmoid(planner_logits)
             
             mask = torch.bernoulli(planner_probs * t).bool()
             
             if mask.sum() > 0:
-                denoiser_logits = denoiser(x, current_t)
+                denoiser_logits = denoiser(x, current_t, class_labels)
                 
                 masked_logits = denoiser_logits[mask]
                 
@@ -316,6 +321,7 @@ class DDPDDenoiser(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            wce = nn.Embedding(config.num_classes, config.n_embd),  # Class embedding
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
@@ -339,16 +345,17 @@ class DDPDDenoiser(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, time, targets=None, mask=None):
+    def forward(self, idx, time, class_labels, targets=None, mask=None):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
         
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
+        class_emb = self.transformer.wce(class_labels).unsqueeze(1).expand(-1, t, -1)  # Expand class embedding to all positions
         
         time_emb = self._get_time_embedding(time, self.config.n_embd)
         
-        x = self.transformer.drop(tok_emb + pos_emb + time_emb.unsqueeze(1))
+        x = self.transformer.drop(tok_emb + pos_emb + class_emb + time_emb.unsqueeze(1))
         freq = self.rotary(None, height_width=(32, 32))
 
         for block in self.transformer.h:
@@ -429,20 +436,23 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 def train_step(batch, planner, denoiser, planner_optimizer, denoiser_optimizer, grad_accumulation_steps):
-    device = batch.device
-    t = torch.rand(batch.shape[0], device=device)
+    device = batch[0].device
+    indices, labels = batch
+    indices = indices.to(device)
+    labels = labels.to(device)
+    t = torch.rand(indices.shape[0], device=device)
     
-    mask = torch.bernoulli(t.unsqueeze(1).expand(-1, batch.shape[1]))
-    corrupted = batch.clone()
+    mask = torch.bernoulli(t.unsqueeze(1).expand(-1, indices.shape[1]))
+    corrupted = indices.clone()
     corrupted[mask.bool()] = 67999  # Last token is mask token
     
 
-    planner_logits, planner_loss = planner(corrupted, t, targets=mask)
+    planner_logits, planner_loss = planner(corrupted, t, labels, targets=mask)
     planner_loss = planner_loss / grad_accumulation_steps
     planner_loss.backward()
     
  
-    denoiser_logits, denoiser_loss = denoiser(corrupted, t, targets=batch, mask=mask)
+    denoiser_logits, denoiser_loss = denoiser(corrupted, t, labels, targets=indices, mask=mask)
     denoiser_loss = denoiser_loss / grad_accumulation_steps
     denoiser_loss.backward()
     
@@ -463,8 +473,11 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
     planner.eval()
     denoiser.eval()
     with torch.no_grad():
+        # Sample random class labels for visualization
+        class_labels = torch.randint(0, planner.module.config.num_classes, (num_samples,), device=device)
         samples = planner.module.sample(
             denoiser.module,
+            class_labels=class_labels,
             batch_size=num_samples,
             sequence_length=sequence_length,
             temperature=0.7,
@@ -472,10 +485,10 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
         )
         # Convert samples to text format
         sample_texts = []
-        for sample in samples:
+        for sample, label in zip(samples, class_labels):
             # Reshape back to 32x32 for visualization
             sample_2d = sample.reshape(32, 32)
-            sample_text = ' '.join(map(str, sample_2d.cpu().tolist()))
+            sample_text = f"Class {label.item()}: " + ' '.join(map(str, sample_2d.cpu().tolist()))
             sample_texts.append(sample_text)
     planner.train()
     denoiser.train()
@@ -597,7 +610,8 @@ def train(
                 train_iter = iter(train_dataloader)
                 batch = next(train_iter)
             
-            batch = batch.to(device)
+            
+            
             losses.append(train_step(
                 batch, planner, denoiser,
                 planner_optimizer, denoiser_optimizer,
