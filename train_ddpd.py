@@ -22,8 +22,6 @@ class DDPDConfig:
     n_layer: int = 6
     n_head: int = 4
     n_embd: int = 512
-    dropout: float = 0.1
-    bias: bool = True 
     qk_layernorm: bool = True
     timesteps: int = 1000
     max_t: float = 0.98
@@ -152,12 +150,10 @@ class Attention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         
-        self.c_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.c_k = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.c_v = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.c_q = nn.Linear(config.n_embd, config.n_embd)
+        self.c_k = nn.Linear(config.n_embd, config.n_embd)
+        self.c_v = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         
         if config.qk_layernorm:
             self.q_norm = nn.LayerNorm(self.head_dim)
@@ -184,16 +180,14 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
-        x = self.dropout(x)
         return x
 
 class Block(nn.Module):
@@ -215,10 +209,8 @@ class DDPDPlanner(nn.Module):
         self.config = config
         
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size + 1, config.n_embd),
             wce = nn.Embedding(config.num_classes, config.n_embd),  # Class embedding
-            drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -228,28 +220,17 @@ class DDPDPlanner(nn.Module):
         print(f"Rotary half of head dim: {dim}")
         self.rotary = Rotary(dim, base=100, h=64, w=64)
 
-        
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, time, class_labels, targets=None):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
         
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
         class_emb = self.transformer.wce(class_labels).unsqueeze(1).expand(-1, t, -1)  # Expand class embedding to all positions
         
         time_emb = self._get_time_embedding(time, self.config.n_embd)
         
-        x = self.transformer.drop(tok_emb + pos_emb + class_emb + time_emb.unsqueeze(1))
+        x = tok_emb + class_emb + time_emb.unsqueeze(1)
         freq = self.rotary(None, height_width=(32, 32))
         for block in self.transformer.h:
             x = block(x, freq)
@@ -274,28 +255,40 @@ class DDPDPlanner(nn.Module):
         return emb
 
     @torch.no_grad()
-    def sample(self, denoiser, class_labels=None, batch_size=1, sequence_length=128, temperature=1.0, top_k=None, device='cuda'):
-        x = torch.full(
-            (batch_size, sequence_length), 
-            self.config.vocab_size - 1, 
-            dtype=torch.long, 
-            device=device
-        )
+    def sample(self, denoiser, class_labels=None, batch_size=1, sequence_length=128, temperature=1.0, top_k=None, device='cuda', dynamic=True):
+        x = torch.randint(0, self.config.vocab_size-1, (batch_size, sequence_length), device=device)
         
         if class_labels is None:
             class_labels = torch.randint(0, self.config.num_classes, (batch_size,), device=device)
         
-        time_steps = torch.linspace(0.98, 0.02, 50, device=device)
+        time_steps = torch.linspace(0.99, 0.02, 50, device=device)
         
         for t in time_steps:
             current_t = torch.full((batch_size,), t, device=device)
             
             planner_logits = self(x, current_t, class_labels)
             planner_probs = torch.sigmoid(planner_logits)
+            init_mask = torch.bernoulli(planner_probs).bool()
             
-            mask = torch.bernoulli(planner_probs * t).bool()
+            if dynamic:
+                # Calculate number of tokens to mask based on current timestep
+                num_tokens_to_mask = min(int(t * sequence_length), sequence_length)
+                
+                # Get indices of top-k most likely tokens to mask
+                _, indices = torch.topk(planner_probs, num_tokens_to_mask, dim=1)
+                
+                # Create mask tensor and set top-k indices to True
+                mask = torch.zeros_like(planner_probs, dtype=torch.bool)
+                mask.scatter_(1, indices, True)
+                
+        
+                percent_masked = mask.sum().item() / mask.numel() * 100
+                print(f"Timestep {t:.3f}: Masked {percent_masked:.1f}% of tokens ({num_tokens_to_mask} tokens) instead of {init_mask.sum().item() / init_mask.numel() * 100:.1f}%")
+            else:
+                mask = init_mask
             
             if mask.sum() > 0:
+                x[mask] = self.config.vocab_size - 1
                 denoiser_logits = denoiser(x, current_t, class_labels)
                 
                 masked_logits = denoiser_logits[mask]
@@ -319,10 +312,8 @@ class DDPDDenoiser(nn.Module):
         self.config = config
         
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size + 1, config.n_embd),
             wce = nn.Embedding(config.num_classes, config.n_embd),  # Class embedding
-            drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -331,31 +322,20 @@ class DDPDDenoiser(nn.Module):
         self.rotary = Rotary(config.n_embd // (2 * config.n_head))
 
         
-        self.apply(self._init_weights)
-        
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, time, class_labels, targets=None, mask=None):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
         
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
         class_emb = self.transformer.wce(class_labels).unsqueeze(1).expand(-1, t, -1)  # Expand class embedding to all positions
         
         time_emb = self._get_time_embedding(time, self.config.n_embd)
         
-        x = self.transformer.drop(tok_emb + pos_emb + class_emb + time_emb.unsqueeze(1))
+        x = tok_emb + class_emb + time_emb.unsqueeze(1)
         freq = self.rotary(None, height_width=(32, 32))
 
         for block in self.transformer.h:
@@ -442,9 +422,20 @@ def train_step(batch, planner, denoiser, planner_optimizer, denoiser_optimizer, 
     labels = labels.to(device)
     t = torch.rand(indices.shape[0], device=device)
     
-    mask = torch.bernoulli(t.unsqueeze(1).expand(-1, indices.shape[1]))
+    # Create binary mask based on timestep t
+    mask = torch.bernoulli(t.unsqueeze(1).expand(-1, indices.shape[1])).bool()
+    
+    # Create corrupted version by cloning original indices
     corrupted = indices.clone()
-    corrupted[mask.bool()] = 67999  # Last token is mask token
+    corrupted_as_null = indices.clone()
+    corrupted_as_null[mask] = planner.module.config.vocab_size
+    
+    # Only corrupt tokens where mask is True
+    # Sample random tokens from vocab range for corrupted positions
+    num_masked = mask.sum().item()
+    if num_masked > 0:
+        corrupted[mask] = torch.randint(0, planner.module.config.vocab_size-1, (num_masked,), device=device)
+    
     
 
     planner_logits, planner_loss = planner(corrupted, t, labels, targets=mask)
@@ -452,7 +443,7 @@ def train_step(batch, planner, denoiser, planner_optimizer, denoiser_optimizer, 
     planner_loss.backward()
     
  
-    denoiser_logits, denoiser_loss = denoiser(corrupted, t, labels, targets=indices, mask=mask)
+    denoiser_logits, denoiser_loss = denoiser(corrupted_as_null, t, labels, targets=indices, mask=mask)
     denoiser_loss = denoiser_loss / grad_accumulation_steps
     denoiser_loss.backward()
     
@@ -567,12 +558,11 @@ def train(
     
     # Initialize models
     config = DDPDConfig(
-        vocab_size=68000,  # ImageNet tokens
+        vocab_size=int(2**16) + 1,  # ImageNet tokens + 1 for mask.
         block_size=1024,  # 32x32 image tokens
         n_layer=12,
-        n_head=8,
+        n_head=6,
         n_embd=768,
-        dropout=0.1
     )
     
     print(f"Rank {local_rank}: Creating models with config: {config}")
@@ -648,18 +638,15 @@ def train(
                 'denoiser_loss': avg_losses['denoiser_loss'],
                 'learning_rate': lr,
             })
-            
-            # Generate and log samples periodically
-            if iter_num % (log_interval * 5) == 0:
-                sample_texts = log_samples(planner, denoiser, device, 1024)  # 32x32 = 1024 tokens
-                wandb.log({
-                    'samples': wandb.Table(
-                        columns=['sample_id', 'text'],
-                        data=[[i, text] for i, text in enumerate(sample_texts)]
-                    )
-                })
         
         if iter_num % save_interval == 0 and local_rank == 0:
+            sample_texts = log_samples(planner, denoiser, device, 1024)  # 32x32 = 1024 tokens
+            wandb.log({
+                'samples': wandb.Table(
+                    columns=['sample_id', 'text'],
+                    data=[[i, text] for i, text in enumerate(sample_texts)]
+                )
+            })
             checkpoint = {
                 'planner_state_dict': planner.module.state_dict(),
                 'denoiser_state_dict': denoiser.module.state_dict(),
@@ -674,8 +661,6 @@ def train(
             }
             save_path = f'checkpoint_iter_{iter_num}.pt'
             torch.save(checkpoint, save_path)
-            if local_rank == 0:
-                wandb.save(save_path)
         
         iter_num += 1
     
