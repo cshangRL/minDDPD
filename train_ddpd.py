@@ -19,7 +19,7 @@ from safetensors.torch import safe_open
 class DDPDConfig:
     model_type: str = "ddpd"
     block_size: int = 1024  # 32x32 image tokens
-    vocab_size: int = 68000  # 1000 tokens + 1 mask token
+    vocab_size: int = int(2**16 + 1)
     n_layer: int = 6
     n_head: int = 4
     n_embd: int = 512
@@ -165,99 +165,78 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3).type_as(x)
 
 
-class Attention(nn.Module):
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        # Combined projections for self-attention and MLP
+        self.chunked_fc = nn.Linear(config.n_embd, 8 * config.n_embd, bias=False)
+        self.attn_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
+        # Cross attention
+        self.cross_k = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.cross_v = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.cross_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
+        # MLP output projection
+        self.mlp_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
         self.n_head = config.n_head
-        self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
+        self.n_embd = config.n_embd
 
-        self.c_q = nn.Linear(config.n_embd, config.n_embd)
-        self.c_k = nn.Linear(config.n_embd, config.n_embd)
-        self.c_v = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # init proj to zeros
+        torch.nn.init.zeros_(self.attn_proj.weight)
+        torch.nn.init.zeros_(self.cross_proj.weight)
+        torch.nn.init.zeros_(self.mlp_proj.weight)
 
-    def forward(self, x, freq=None, v1=None):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)  # B, T, n_head, D
-        cos, sin = freq
-
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
-
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+        # make initialization bit smaller than typical
+        torch.nn.init.normal_(
+            self.chunked_fc.weight, mean=0.0, std=0.02 / math.sqrt(config.n_embd)
         )
 
-        y = y.transpose(1, 2).contiguous().view_as(x)
-        y = self.c_proj(y)
-        return y
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
-
-        self.c_q = nn.Linear(config.n_embd, config.n_embd)
-        self.c_k = nn.Linear(config.n_embd, config.n_embd)
-        self.c_v = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
-    def forward(self, x, context):
+    def forward(self, x, freq=None, context=None):
         B, T, C = x.size()
-        _, S, _ = context.size()
+        H = self.n_head
 
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(context).view(B, S, self.n_head, self.head_dim)
-        v = self.c_v(context).view(B, S, self.n_head, self.head_dim)
+        # Combined self-attention + MLP input projection
+        qkv_mlp = F.rms_norm(x, (x.size(-1),))
+        chunks = self.chunked_fc(qkv_mlp).split([C, C, C, 4 * C, C], dim=-1)
+        q, k, v, mlp_intermediate, cross_q = chunks
+
+        # Self attention
+        q = q.view(B, T, H, self.head_dim)
+        k = k.view(B, T, H, self.head_dim)
+        v = v.view(B, T, H, self.head_dim)
 
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
 
-        y = F.scaled_dot_product_attention(
+        attn = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
         )
+        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
+        x = x + self.attn_proj(attn)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
+        # Cross attention
+        if context is not None:
+            _, S, _ = context.size()
 
+            q = cross_q.view(B, T, H, self.head_dim)
+            k = self.cross_k(context).view(B, S, H, self.head_dim)
+            v = self.cross_v(context).view(B, S, H, self.head_dim)
 
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+            q = F.rms_norm(q, (q.size(-1),))
+            k = F.rms_norm(k, (k.size(-1),))
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+            cross_attn = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
+            )
+            cross_attn = cross_attn.transpose(1, 2).contiguous().view(B, T, C)
+            x = x + self.cross_proj(cross_attn)
 
+        mlp = self.mlp_proj(F.relu(mlp_intermediate).square())
+        x = x + mlp
 
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = Attention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.cross_attn = CrossAttention(config)
-        self.ln_3 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
-
-    def forward(self, x, freq=None, context=None):
-        x = x + self.attn(self.ln_1(x), freq=freq)
-        x = x + self.cross_attn(self.ln_2(x), context=context)
-        x = x + self.mlp(self.ln_3(x))
         return x
 
 
@@ -274,12 +253,11 @@ class DDPDModel(nn.Module):
                     config.num_classes, 16 * config.n_embd
                 ),  # Class embedding
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f=nn.LayerNorm(config.n_embd),
             )
         )
 
         if model_type == "planner":
-            self.head = nn.Linear(config.n_embd, 1)
+            self.head = nn.Linear(config.n_embd, 1, bias=False)
         else:  # denoiser
             self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -319,7 +297,7 @@ class DDPDModel(nn.Module):
         for block in self.transformer.h:
             x = block(x, freq, context=cond)
 
-        x = self.transformer.ln_f(x)
+        x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.head(x)
         if self.model_type == "planner":
@@ -408,48 +386,39 @@ class DDPDModel(nn.Module):
         return x
 
 
-def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
-    decay = set()
-    no_decay = set()
-    whitelist_weight_modules = (torch.nn.Linear,)
-    blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+def print0(s):
+    if dist.get_rank() == 0:
+        print(s)
 
-    for mn, m in model.named_modules():
-        for pn, p in m.named_parameters():
-            fpn = "%s.%s" % (mn, pn) if mn else pn
 
-            if pn.endswith("bias"):
-                no_decay.add(fpn)
-            elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
-                decay.add(fpn)
-            elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
-                no_decay.add(fpn)
-
+def configure_optimizers(
+    model, weight_decay, learning_rate, betas, device_type, custom_lrs={}
+):
+    param_groups = []
     param_dict = {pn: p for pn, p in model.named_parameters()}
-    inter_params = decay & no_decay
-    union_params = decay | no_decay
-    assert len(inter_params) == 0
-    assert len(param_dict.keys() - union_params) == 0
+    for name, param in model.named_parameters():
 
-    optim_groups = [
-        {
-            "params": [param_dict[pn] for pn in sorted(list(decay))],
-            "weight_decay": weight_decay,
-            "lr": learning_rate,
-        },
-        {
-            "params": [param_dict[pn] for pn in sorted(list(no_decay))],
-            "weight_decay": 0.0,
-            "lr": 0.01,
-        },
-    ]
+        if "weight" in name:
+            fan_in = torch.nn.init._calculate_fan_in_and_fan_out(param)[0]
+            lr = learning_rate / max(fan_in, 1)  # Avoid division by zero
+            param_groups.append(
+                {"params": [param], "weight_decay": weight_decay, "lr": lr}
+            )
+        else:
+            if name in custom_lrs:
+                lr = custom_lrs[name]
+            else:
+                lr = learning_rate * 0.1
+            param_groups.append(
+                {"params": [param], "weight_decay": weight_decay, "lr": lr}
+            )
+
+        print0(f"name: {name}, lr: {lr}")
 
     fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and device_type == "cuda"
     extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(
-        optim_groups, lr=learning_rate, betas=betas, **extra_args
-    )
+    optimizer = torch.optim.AdamW(param_groups, betas=betas, **extra_args)
 
     return optimizer
 
@@ -520,11 +489,9 @@ def train_step(
 def get_lr_scheduler(optimizer, warmup_iters, lr_decay_iters, max_iters):
     def lr_lambda(step):
         if step < warmup_iters:
-            return float(step) / float(max(1, warmup_iters))
-        decay_ratio = float(step - warmup_iters) / float(
-            max(1, lr_decay_iters - warmup_iters)
-        )
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * decay_ratio)))
+            return step / warmup_iters
+        else:
+            return (max_iters - step) / lr_decay_iters
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -654,8 +621,8 @@ def train(
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=True)
     print(f"Rank {local_rank}: Models created successfully")
 
-    planner = torch.compile(planner, mode="reduce-overhead")
-    denoiser = torch.compile(denoiser, mode="reduce-overhead")
+    # planner = torch.compile(planner, mode="reduce-overhead")
+    # denoiser = torch.compile(denoiser, mode="reduce-overhead")
 
     # Setup optimizers and schedulers
     planner_optimizer = configure_optimizers(
