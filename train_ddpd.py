@@ -13,7 +13,8 @@ import os
 import wandb
 import json
 from safetensors.torch import safe_open
-
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 @dataclass
 class DDPDConfig:
@@ -33,7 +34,7 @@ class ImageTokenDataset(Dataset):
     def __init__(
         self,
         safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors",
-        debug=False,
+        debug=True,
     ):
         print(f"Initializing ImageTokenDataset with path: {safetensor_path}")
         self.safetensor_path = safetensor_path
@@ -248,7 +249,7 @@ class DDPDModel(nn.Module):
 
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size + 1, config.n_embd),
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
                 wce=nn.Embedding(
                     config.num_classes, 16 * config.n_embd
                 ),  # Class embedding
@@ -257,9 +258,9 @@ class DDPDModel(nn.Module):
         )
 
         if model_type == "planner":
-            self.head = nn.Linear(config.n_embd, 1, bias=False)
+            self.head = nn.Linear(config.n_embd, 1, bias=True)
         else:  # denoiser
-            self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            self.head = nn.Linear(config.n_embd, config.vocab_size - 1, bias=True)
 
         dim = config.n_embd // (2 * config.n_head)
         print(f"Rotary half of head dim: {dim}")
@@ -299,10 +300,11 @@ class DDPDModel(nn.Module):
 
         x = F.rms_norm(x, (x.size(-1),))
 
-        logits = self.head(x)
+        logits = self.head(x).float()
+        
         if self.model_type == "planner":
             logits = logits.squeeze(-1)
-
+        
         if targets is not None:
             if self.model_type == "planner":
                 loss = F.binary_cross_entropy_with_logits(logits, targets.float())
@@ -310,9 +312,10 @@ class DDPDModel(nn.Module):
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
                 )
-                loss = (loss * mask.view(-1)).sum() / mask.sum()
+                loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-5)
             return logits, loss
-        return logits
+        else:
+            return logits
 
     def _get_time_embedding(self, timesteps, dim):
         half_dim = dim // 2
@@ -324,7 +327,7 @@ class DDPDModel(nn.Module):
             emb = F.pad(emb, (0, 1), mode="constant")
         return self.time_embed(emb)
 
-    @torch.no_grad()
+    @torch.no_grad() 
     def sample(
         self,
         denoiser,
@@ -335,6 +338,7 @@ class DDPDModel(nn.Module):
         top_k=None,
         device="cuda",
         dynamic=False,
+        infer_time_from_planner=False,
     ):
         if self.model_type != "planner":
             raise ValueError("Sampling can only be done with planner model")
@@ -348,41 +352,41 @@ class DDPDModel(nn.Module):
                 0, self.config.num_classes, (batch_size,), device=device
             )
 
-        time_steps = torch.linspace(0.99, 0.02, 50, device=device)
+        time_steps = torch.linspace(1.0, 0.01, 100, device=device)
 
         for t in time_steps:
             current_t = torch.full((batch_size,), t, device=device)
 
             planner_logits = self(x, current_t, class_labels)
             planner_probs = torch.sigmoid(planner_logits)
-            init_mask = torch.bernoulli(planner_probs).bool()
+            # infer time
+            if infer_time_from_planner:
+                t = planner_probs.mean().item()
+                current_t = torch.full((batch_size,), t, device=device)
+            
+            
+            change_dim = torch.multinomial(planner_probs, num_samples=(32 * 32) // 50)
+            mask = torch.zeros_like(planner_probs.squeeze(-1), dtype=torch.bool)
+            
 
-            if dynamic:
-                num_tokens_to_mask = min(int(t * sequence_length), sequence_length)
-                _, indices = torch.topk(planner_probs, num_tokens_to_mask, dim=1)
-                mask = torch.zeros_like(planner_probs, dtype=torch.bool)
-                mask.scatter_(1, indices, True)
-
-                percent_masked = mask.sum().item() / mask.numel() * 100
-                print(
-                    f"Timestep {t:.3f}: Masked {percent_masked:.1f}% of tokens ({num_tokens_to_mask} tokens) instead of {init_mask.sum().item() / init_mask.numel() * 100:.1f}%"
-                )
-            else:
-                mask = init_mask
-
+            mask.scatter_(1, change_dim, True)
+            print(mask.sum(dim = 1))
+            
+            
+            
             if mask.sum() > 0:
                 x[mask] = self.config.vocab_size - 1
                 denoiser_logits = denoiser(x, current_t, class_labels)
 
                 masked_logits = denoiser_logits[mask]
-
+                
                 masked_logits = masked_logits / temperature
 
                 probs = F.softmax(masked_logits, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
                 x[mask] = next_tokens
-
+               
         return x
 
 
@@ -448,7 +452,7 @@ def train_step(
     denoiser_optimizer,
     grad_accumulation_steps,
 ):
-    device = batch[0].device
+    device = 'cuda'
     indices, labels = batch
     indices = indices.to(device)
     labels = labels.to(device)
@@ -527,7 +531,7 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
 
 
 @click.command()
-@click.option("--batch-size", default=32, help="Batch size per GPU")
+@click.option("--batch-size", default=16, help="Batch size per GPU")
 @click.option("--planner-lr", default=2e-4, help="Planner learning rate")
 @click.option("--denoiser-lr", default=2e-4, help="Denoiser learning rate")
 @click.option("--weight-decay", default=0.1, help="Weight decay")
@@ -536,7 +540,7 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
 @click.option("--lr-decay-iters", default=2000, help="LR decay iterations")
 @click.option("--grad-clip", default=1.0, help="Gradient clipping")
 @click.option(
-    "--grad-accumulation-steps", default=2, help="Gradient accumulation steps"
+    "--grad-accumulation-steps", default=1, help="Gradient accumulation steps"
 )
 @click.option("--log-interval", default=100, help="Log interval")
 @click.option("--save-interval", default=1000, help="Save interval")
@@ -566,9 +570,7 @@ def train(
     setup_distributed()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
+    torch.cuda.set_device(device)
     # Initialize wandb only on rank 0
     if local_rank == 0:
         wandb.init(
@@ -599,8 +601,9 @@ def train(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
-        num_workers=2,  # Reduced num_workers
-        pin_memory=True,
+        num_workers=8,
+        pin_memory=False,
+        persistent_workers=True,
     )
     print(f"Rank {local_rank}: DataLoader created successfully")
 
@@ -626,10 +629,10 @@ def train(
 
     # Setup optimizers and schedulers
     planner_optimizer = configure_optimizers(
-        planner, weight_decay, planner_lr, (0.9, 0.95), "cuda"
+        planner, weight_decay, planner_lr, (0.95, 0.99), "cuda"
     )
     denoiser_optimizer = configure_optimizers(
-        denoiser, weight_decay, denoiser_lr, (0.9, 0.95), "cuda"
+        denoiser, weight_decay, denoiser_lr, (0.95, 0.99), "cuda"
     )
 
     planner_scheduler = get_lr_scheduler(
