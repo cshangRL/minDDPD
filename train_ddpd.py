@@ -13,21 +13,15 @@ import os
 import wandb
 import json
 from safetensors.torch import safe_open
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-@dataclass
-class DDPDConfig:
-    model_type: str = "ddpd"
-    block_size: int = 1024  # 32x32 image tokens
-    vocab_size: int = int(2**16 + 1)
-    n_layer: int = 6
-    n_head: int = 4
-    n_embd: int = 512
-    qk_layernorm: bool = True
-    timesteps: int = 1000
-    max_t: float = 0.98
-    num_classes: int = 1000  # Number of ImageNet classes
+from model import DDPDModel, DDPDConfig, configure_optimizers, print0
+from PIL import Image
+
+
+MASK_IDX = 0
 
 
 class ImageTokenDataset(Dataset):
@@ -41,26 +35,20 @@ class ImageTokenDataset(Dataset):
 
         metadata_path = safetensor_path.replace(".safetensors", "_metadata.json")
         print(f"Loading metadata from: {metadata_path}")
-        try:
-            with open(metadata_path, "r") as f:
-                self.metadata = json.load(f)
-                self.total_samples = self.metadata["total_samples"]
-                print(f"Total samples in metadata: {self.total_samples}")
-        except Exception as e:
-            print(f"Error loading metadata: {e}")
-            raise
+
+        with open(metadata_path, "r") as f:
+            self.metadata = json.load(f)
+            self.total_samples = self.metadata["total_samples"]
+            print(f"Total samples in metadata: {self.total_samples}")
 
         print(f"Loading tensors from: {safetensor_path}")
-        try:
-            with safe_open(safetensor_path, framework="pt") as f:
-                self.indices = f.get_tensor("indices").to(torch.uint16).long()
-                self.labels = f.get_tensor("labels").long()
-                print(
-                    f"Loaded indices shape: {self.indices.shape}, labels shape: {self.labels.shape}"
-                )
-        except Exception as e:
-            print(f"Error loading tensors: {e}")
-            raise
+
+        with safe_open(safetensor_path, framework="pt") as f:
+            self.indices = f.get_tensor("indices").to(torch.uint16).long()
+            self.labels = f.get_tensor("labels").long()
+            print(
+                f"Loaded indices shape: {self.indices.shape}, labels shape: {self.labels.shape}"
+            )
 
         if debug:
             samplesze = 64
@@ -84,347 +72,38 @@ class ImageTokenDataset(Dataset):
             raise
 
 
-class Rotary(nn.Module):
-    def __init__(self, dim, base=100, h=64, w=64, var_like_order=False):
-        super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / (dim)))
-        self.h = h
-        self.w = w
+class MNISTTokenDataset(Dataset):
+    def __init__(self, debug=False):
+        print("Initializing MNISTTokenDataset")
+        from torchvision.datasets import MNIST
+        from torchvision import transforms
 
-        t_h = torch.arange(h).type_as(self.inv_freq)
-        t_w = torch.arange(w).type_as(self.inv_freq)
-        freqs_h = torch.outer(t_h, self.inv_freq).unsqueeze(1)
-        freqs_w = torch.outer(t_w, self.inv_freq).unsqueeze(0)
-        freqs_h = freqs_h.repeat(1, w, 1)
-        freqs_w = freqs_w.repeat(h, 1, 1)
-        freqs_hw = torch.cat([freqs_h, freqs_w], 2)
-
-        self.register_buffer("freqs_hw_cos", freqs_hw.cos())
-        self.register_buffer("freqs_hw_sin", freqs_hw.sin())
-        self.cache_cos = None
-        self.cache_sin = None
-
-    def forward(
-        self, x, height_width=None, extend_with_register_tokens=0, augment=False
-    ):
-        if self.cache_cos is not None and self.cache_sin is not None:
-            return self.cache_cos, self.cache_sin
-
-        if height_width is not None:
-            this_h, this_w = height_width
-        else:
-            this_hw = x.shape[1]
-            this_h, this_w = int(this_hw**0.5), int(this_hw**0.5)
-
-        if augment:
-            start_h = torch.randint(0, self.h - this_h + 1, (1,)).item()
-            start_w = torch.randint(0, self.w - this_w + 1, (1,)).item()
-        else:
-            start_h = 0
-            start_w = 0
-
-        cos = self.freqs_hw_cos[start_h : start_h + this_h, start_w : start_w + this_w]
-        sin = self.freqs_hw_sin[start_h : start_h + this_h, start_w : start_w + this_w]
-
-        cos = cos.clone().reshape(this_h * this_w, -1)
-        sin = sin.clone().reshape(this_h * this_w, -1)
-
-        if extend_with_register_tokens > 0:
-            cos = torch.cat(
-                [
-                    torch.ones(extend_with_register_tokens, cos.shape[1]).to(
-                        cos.device
-                    ),
-                    cos,
-                ],
-                0,
-            )
-            sin = torch.cat(
-                [
-                    torch.zeros(extend_with_register_tokens, sin.shape[1]).to(
-                        sin.device
-                    ),
-                    sin,
-                ],
-                0,
-            )
-
-        self.cache_cos = cos[None, :, None, :]
-        self.cache_sin = sin[None, :, None, :]
-
-        return self.cache_cos, self.cache_sin  # 1, T, 1, D
-
-
-def apply_rotary_emb(x, cos, sin):
-    cos, sin = cos[:, : x.shape[1]], sin[:, : x.shape[1]]
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
-
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Combined projections for self-attention and MLP
-        self.chunked_fc = nn.Linear(config.n_embd, 8 * config.n_embd, bias=False)
-        self.attn_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-
-        # Cross attention
-        self.cross_k = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.cross_v = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.cross_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-
-        # MLP output projection
-        self.mlp_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-        self.n_head = config.n_head
-        self.head_dim = config.n_embd // config.n_head
-        self.n_embd = config.n_embd
-
-        # init proj to zeros
-        torch.nn.init.zeros_(self.attn_proj.weight)
-        torch.nn.init.zeros_(self.cross_proj.weight)
-        torch.nn.init.zeros_(self.mlp_proj.weight)
-
-        # make initialization bit smaller than typical
-        torch.nn.init.normal_(
-            self.chunked_fc.weight, mean=0.0, std=0.02 / math.sqrt(config.n_embd)
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Resize((32, 32)),  # Resize to 8x8 like the ImageNet dataset
+                transforms.Lambda(lambda x: (x * 7.0).long()),  # Scale to 16-bit range
+            ]
         )
 
-    def forward(self, x, freq=None, context=None):
-        B, T, C = x.size()
-        H = self.n_head
-
-        # Combined self-attention + MLP input projection
-        qkv_mlp = F.rms_norm(x, (x.size(-1),))
-        chunks = self.chunked_fc(qkv_mlp).split([C, C, C, 4 * C, C], dim=-1)
-        q, k, v, mlp_intermediate, cross_q = chunks
-
-        # Self attention
-        q = q.view(B, T, H, self.head_dim)
-        k = k.view(B, T, H, self.head_dim)
-        v = v.view(B, T, H, self.head_dim)
-
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-
-        attn = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
+        self.mnist = MNIST(
+            root="./data", train=True, download=True, transform=transform
         )
-        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
-        x = x + self.attn_proj(attn)
+        self.total_samples = len(self.mnist)
+        print(f"Total samples: {self.total_samples}")
 
-        # Cross attention
-        if context is not None:
-            _, S, _ = context.size()
+    def __len__(self):
+        return int(self.total_samples)
 
-            q = cross_q.view(B, T, H, self.head_dim)
-            k = self.cross_k(context).view(B, S, H, self.head_dim)
-            v = self.cross_v(context).view(B, S, H, self.head_dim)
-
-            q = F.rms_norm(q, (q.size(-1),))
-            k = F.rms_norm(k, (k.size(-1),))
-
-            cross_attn = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
-            )
-            cross_attn = cross_attn.transpose(1, 2).contiguous().view(B, T, C)
-            x = x + self.cross_proj(cross_attn)
-
-        mlp = self.mlp_proj(F.relu(mlp_intermediate).square())
-        x = x + mlp
-
-        return x
-
-
-class DDPDModel(nn.Module):
-    def __init__(self, config, model_type="planner"):
-        super().__init__()
-        self.config = config
-        self.model_type = model_type
-
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wce=nn.Embedding(
-                    config.num_classes, 16 * config.n_embd
-                ),  # Class embedding
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            )
-        )
-
-        if model_type == "planner":
-            self.head = nn.Linear(config.n_embd, 1, bias=True)
-        else:  # denoiser
-            self.head = nn.Linear(config.n_embd, config.vocab_size - 1, bias=True)
-
-        dim = config.n_embd // (2 * config.n_head)
-        print(f"Rotary half of head dim: {dim}")
-        self.rotary = Rotary(dim, base=100, h=64, w=64)
-        self.time_embed = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
-            nn.SiLU(),
-            nn.Linear(config.n_embd, config.n_embd),
-        )
-
-        for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
-                torch.nn.init.normal_(
-                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
-                )
-
-        # init head zero
-
-        torch.nn.init.zeros_(self.head.weight)
-
-    def forward(self, idx, time, class_labels, targets=None, mask=None):
-        b, t = idx.size()
-
-        x = self.transformer.wte(idx)
-        class_emb = self.transformer.wce(class_labels).reshape(b, 16, -1)
-
-        if self.model_type == "denoiser":
-            time_emb = self._get_time_embedding(time * 1000, self.config.n_embd)
-            cond = torch.cat([class_emb, time_emb.unsqueeze(1)], dim=1)
-        else:
-            cond = class_emb
-
-        freq = self.rotary(None, height_width=(32, 32))
-
-        for block in self.transformer.h:
-            x = block(x, freq, context=cond)
-
-        x = F.rms_norm(x, (x.size(-1),))
-
-        logits = self.head(x).float()
-        
-        if self.model_type == "planner":
-            logits = logits.squeeze(-1)
-        
-        if targets is not None:
-            if self.model_type == "planner":
-                loss = F.binary_cross_entropy_with_logits(logits, targets.float())
-            else:  # denoiser
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
-                )
-                loss = (loss * mask.view(-1)).sum() / (mask.sum() + 1e-5)
-            return logits, loss
-        else:
-            return logits
-
-    def _get_time_embedding(self, timesteps, dim):
-        half_dim = dim // 2
-        emb = math.log(1000.0) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
-        emb = timesteps[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-        if dim % 2 == 1:
-            emb = F.pad(emb, (0, 1), mode="constant")
-        return self.time_embed(emb)
-
-    @torch.no_grad() 
-    def sample(
-        self,
-        denoiser,
-        class_labels=None,
-        batch_size=1,
-        sequence_length=128,
-        temperature=1.0,
-        top_k=None,
-        device="cuda",
-        dynamic=False,
-        infer_time_from_planner=False,
-    ):
-        if self.model_type != "planner":
-            raise ValueError("Sampling can only be done with planner model")
-
-        x = torch.randint(
-            0, self.config.vocab_size - 1, (batch_size, sequence_length), device=device
-        )
-
-        if class_labels is None:
-            class_labels = torch.randint(
-                0, self.config.num_classes, (batch_size,), device=device
-            )
-
-        time_steps = torch.linspace(1.0, 0.01, 100, device=device)
-
-        for t in time_steps:
-            current_t = torch.full((batch_size,), t, device=device)
-
-            planner_logits = self(x, current_t, class_labels)
-            planner_probs = torch.sigmoid(planner_logits)
-            # infer time
-            if infer_time_from_planner:
-                t = planner_probs.mean().item()
-                current_t = torch.full((batch_size,), t, device=device)
-            
-            
-            change_dim = torch.multinomial(planner_probs, num_samples=(32 * 32) // 50)
-            mask = torch.zeros_like(planner_probs.squeeze(-1), dtype=torch.bool)
-            
-
-            mask.scatter_(1, change_dim, True)
-            print(mask.sum(dim = 1))
-            
-            
-            
-            if mask.sum() > 0:
-                x[mask] = self.config.vocab_size - 1
-                denoiser_logits = denoiser(x, current_t, class_labels)
-
-                masked_logits = denoiser_logits[mask]
-                
-                masked_logits = masked_logits / temperature
-
-                probs = F.softmax(masked_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-                x[mask] = next_tokens
-               
-        return x
-
-
-def print0(s):
-    if dist.get_rank() == 0:
-        print(s)
-
-
-def configure_optimizers(
-    model, weight_decay, learning_rate, betas, device_type, custom_lrs={}
-):
-    param_groups = []
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    for name, param in model.named_parameters():
-
-        if "weight" in name:
-            fan_in = torch.nn.init._calculate_fan_in_and_fan_out(param)[0]
-            lr = learning_rate / max(fan_in, 1)  # Avoid division by zero
-            param_groups.append(
-                {"params": [param], "weight_decay": weight_decay, "lr": lr}
-            )
-        else:
-            if name in custom_lrs:
-                lr = custom_lrs[name]
-            else:
-                lr = learning_rate * 0.1
-            param_groups.append(
-                {"params": [param], "weight_decay": weight_decay, "lr": lr}
-            )
-
-        print0(f"name: {name}, lr: {lr}")
-
-    fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = fused_available and device_type == "cuda"
-    extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, **extra_args)
-
-    return optimizer
+    def __getitem__(self, idx):
+        try:
+            image, label = self.mnist[idx]
+            # Flatten the 8x8 image into 64 tokens
+            indices = image.reshape(-1)
+            return indices, label
+        except Exception as e:
+            print(f"Error in __getitem__ for idx {idx}: {e}")
+            raise
 
 
 def setup_distributed():
@@ -452,7 +131,7 @@ def train_step(
     denoiser_optimizer,
     grad_accumulation_steps,
 ):
-    device = 'cuda'
+    device = "cuda"
     indices, labels = batch
     indices = indices.to(device)
     labels = labels.to(device)
@@ -461,28 +140,43 @@ def train_step(
     # Create binary mask based on timestep t
     mask = torch.bernoulli(t.unsqueeze(1).expand(-1, indices.shape[1])).bool()
 
+    # print0(f"mask shape: {mask.shape}, mask: {mask[:3, :3]}")
+
     # Create corrupted version by cloning original indices
-    corrupted = indices.clone()
-    corrupted_as_null = indices.clone()
-    corrupted_as_null[mask] = planner.module.config.vocab_size - 1
+    input_indices = indices.clone()
+    # corrupted_as_null = indices.clone()
+    # corrupted_as_null[mask] = MASK_IDX
 
     # Only corrupt tokens where mask is True
     # Sample random tokens from vocab range for corrupted positions
     num_masked = mask.sum().item()
     if num_masked > 0:
-        corrupted[mask] = torch.randint(
-            0, planner.module.config.vocab_size - 1, (num_masked,), device=device
-        )
+        input_indices[mask] = torch.randint(0, MASK_IDX, (num_masked,), device=device)
+    corrupted_as_null = input_indices.clone()
 
-    planner_logits, planner_loss = planner(corrupted, t, labels, targets=mask)
+    planner_logits, planner_loss = planner(input_indices, t, labels, targets=mask)
     planner_loss = planner_loss / grad_accumulation_steps
     planner_loss.backward()
+
+    # print acc of planner
+    with torch.no_grad():
+        # since planner is binary classification, we can use accuracy
+        where_one = (planner_logits > 0).float()
+        where_zero = (planner_logits < 0).float()
+        acc = (where_one * mask.float() + where_zero * (1 - mask.float())).mean()
+        print0(f"Planner accuracy: {acc:.4f}")
 
     denoiser_logits, denoiser_loss = denoiser(
         corrupted_as_null, t, labels, targets=indices, mask=mask
     )
     denoiser_loss = denoiser_loss / grad_accumulation_steps
     denoiser_loss.backward()
+
+    with torch.no_grad():
+        denoiser_at_mask = denoiser_logits[mask]
+        indices_at_mask = indices[mask]
+        acc = (denoiser_at_mask.argmax(dim=-1) == indices_at_mask.long()).float().mean()
+        print0(f"Denoiser accuracy: {acc:.4f}")
 
     return {
         "planner_loss": planner_loss.item() * grad_accumulation_steps,
@@ -521,10 +215,11 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
         for sample, label in zip(samples, class_labels):
             # Reshape back to 32x32 for visualization
             sample_2d = sample.reshape(32, 32)
-            sample_text = f"Class {label.item()}: " + " ".join(
-                map(str, sample_2d.cpu().tolist())
-            )
-            sample_texts.append(sample_text)
+            # to PIL image. make it to 1 channel
+            images = sample_2d.cpu().float().numpy() / 8  # shape : 32, 32
+            sample_pil = Image.fromarray(images, mode="L")
+            sample_texts.append(sample_pil)
+
     planner.train()
     denoiser.train()
     return sample_texts
@@ -551,6 +246,8 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
     help="Weights & Biases entity (username or team name)",
 )
 @click.option("--wandb-name", default=None, help="Weights & Biases run name")
+@click.option("--mnist", default=True, help="Use MNIST dataset")
+@click.option("--ckpt-dir", default="checkpoints", help="Checkpoint directory")
 def train(
     batch_size,
     planner_lr,
@@ -566,6 +263,8 @@ def train(
     wandb_project,
     wandb_entity,
     wandb_name,
+    mnist,
+    ckpt_dir,
 ):
     setup_distributed()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -591,9 +290,12 @@ def train(
         )
 
     print(f"Rank {local_rank}: Creating dataset")
-    train_dataset = ImageTokenDataset(
-        safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors"
-    )
+    if mnist:
+        train_dataset = MNISTTokenDataset(debug=True)
+    else:
+        train_dataset = ImageTokenDataset(
+            safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors"
+        )
     print(f"Rank {local_rank}: Dataset created successfully")
 
     train_sampler = DistributedSampler(train_dataset)
@@ -616,6 +318,14 @@ def train(
         n_embd=768,
     )
 
+    if mnist:
+        config.vocab_size = 9
+        config.block_size = 1024
+        config.num_classes = 10
+
+    global MASK_IDX
+    MASK_IDX = config.vocab_size - 1
+    print(f"Rank {local_rank}: MASK_IDX: {MASK_IDX}")
     print(f"Rank {local_rank}: Creating models with config: {config}")
     planner = DDPDModel(config, model_type="planner").to(device)
     denoiser = DDPDModel(config, model_type="denoiser").to(device)
@@ -708,15 +418,15 @@ def train(
             )
 
         if iter_num % save_interval == 0 and local_rank == 0:
-            sample_texts = log_samples(
+            sample_pil_images = log_samples(
                 planner, denoiser, device, 1024
             )  # 32x32 = 1024 tokens
             wandb.log(
                 {
-                    "samples": wandb.Table(
-                        columns=["sample_id", "text"],
-                        data=[[i, text] for i, text in enumerate(sample_texts)],
-                    )
+                    "images": [
+                        wandb.Image(img, caption=f"Samples {i}")
+                        for i, img in enumerate(sample_pil_images)
+                    ]
                 }
             )
             checkpoint = {
@@ -731,8 +441,10 @@ def train(
                     "denoiser_config": denoiser.module.config,
                 },
             }
-            save_path = f"checkpoint_iter_{iter_num}.pt"
+            save_path = f"{ckpt_dir}/checkpoint_iter_{iter_num}.pt"
+            os.makedirs(ckpt_dir, exist_ok=True)
             torch.save(checkpoint, save_path)
+            print(f"Rank {local_rank}: Checkpoint saved to {save_path}")
 
         iter_num += 1
 

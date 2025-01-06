@@ -118,7 +118,7 @@ def sample(
             temperature=temperature,
             top_k=top_k,
             device=device,
-            dynamic=True
+            dynamic=True,
         )
 
     # Decode tokens to images
