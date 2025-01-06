@@ -136,6 +136,7 @@ class Block(nn.Module):
             self.chunked_fc.weight, mean=0.0, std=0.02 / math.sqrt(config.n_embd)
         )
 
+    @torch.compile(mode="reduce-overhead")
     def forward(self, x, freq=None, context=None):
         B, T, C = x.size()
         H = self.n_head

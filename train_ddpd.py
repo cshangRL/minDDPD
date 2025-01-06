@@ -26,7 +26,7 @@ class ImageTokenDataset(Dataset):
     def __init__(
         self,
         safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors",
-        debug=True,
+        debug=False,
     ):
         print(f"Initializing ImageTokenDataset with path: {safetensor_path}")
         self.safetensor_path = safetensor_path
@@ -325,9 +325,9 @@ def train(
     config = DDPDConfig(
         vocab_size=int(2**16) + 1,  # ImageNet tokens + 1 for mask.
         block_size=1024,  # 32x32 image tokens
-        n_layer=12,
-        n_head=6,
-        n_embd=768,
+        n_layer=14,
+        n_head=8,
+        n_embd=1024,
     )
 
     if mnist:
