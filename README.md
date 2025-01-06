@@ -1,6 +1,10 @@
 
 # minDDPD: Minimal Implementation of Discrete Diffusion with Planned Denoising
 
+<div align="center">
+  <video src="contents/all_images.mp4" width="70%"> </video>
+</div>
+
 This is an unofficial implementation of [Think While You Generate: Discrete Diffusion with Planned Denoising](https://arxiv.org/abs/2410.06264).
 
 ## Overview

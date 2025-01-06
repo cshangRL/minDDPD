@@ -1,3 +1,6 @@
 *.pt
 wandb
 __pycache__
+samples
+data
+checkpoints
