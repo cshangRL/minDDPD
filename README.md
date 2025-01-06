@@ -2,8 +2,12 @@
 # minDDPD: Minimal Implementation of Discrete Diffusion with Planned Denoising
 
 <div align="center">
-  <video src="https://github.com/fal-ai-community/minDDPD/raw/refs/heads/main/contents/all_images.mp4" width="70%"> </video>
+  <video src="https://github.com/user-attachments/assets/e17bd9c1-19c8-4e58-a92e-96b2141a3dd0" width="70%"> </video>
 </div>
+
+> Planner's probability map for each noisy image tokens. Every step, 20 tokens are denoised. 
+
+
 
 This is an unofficial implementation of [Think While You Generate: Discrete Diffusion with Planned Denoising](https://arxiv.org/abs/2410.06264).
 
