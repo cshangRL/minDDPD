@@ -1,12 +1,12 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from train_ddpd import DDPDConfig, DDPDModel
-import click
 import os
+
+import click
+import numpy as np
+import torch
 import torch.jit as jit
 from PIL import Image
-import numpy as np
+
+from train_ddpd import DDPDConfig, DDPDModel
 
 
 def load_models(checkpoint_path, device):
@@ -119,6 +119,7 @@ def sample(
             top_k=top_k,
             device=device,
             dynamic=True,
+            infer_time_from_planner=True,
         )
 
     # Decode tokens to images

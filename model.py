@@ -1,18 +1,11 @@
+import inspect
+import math
+from dataclasses import dataclass
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from dataclasses import dataclass
-import math
-import inspect
-import click
-import os
-import wandb
-import json
-from safetensors.torch import safe_open
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -287,7 +280,8 @@ class DDPDModel(nn.Module):
         top_k=None,
         device="cuda",
         dynamic=False,
-        infer_time_from_planner=False,
+        num_samples=10,
+        infer_time_from_planner=True,
     ):
         if self.model_type != "planner":
             raise ValueError("Sampling can only be done with planner model")
@@ -301,14 +295,14 @@ class DDPDModel(nn.Module):
                 0, self.config.num_classes, (batch_size,), device=device
             )
 
-        time_steps = torch.linspace(1.0, 0.01, 100, device=device)
+        time_steps = torch.linspace(1.0, 0.00, 300, device=device)
         last_t = len(time_steps) - 1
 
         for idx, t in enumerate(time_steps):
             current_t = torch.full((batch_size,), t, device=device)
 
             planner_logits = self(x, current_t, class_labels)
-            planner_probs = torch.sigmoid(planner_logits)
+            planner_probs = torch.sigmoid(planner_logits / 0.1)
             # infer time
             if infer_time_from_planner:
                 t = planner_probs.mean().item()
@@ -319,24 +313,27 @@ class DDPDModel(nn.Module):
                 mask = planner_probs > 0.01
 
             else:
-                change_dim = torch.multinomial(planner_probs, num_samples=1)
+                change_dim = torch.multinomial(planner_probs, num_samples=num_samples)
                 mask = torch.zeros_like(planner_probs.squeeze(-1), dtype=torch.bool)
-
-            mask.scatter_(1, change_dim, True)
-            print(mask.sum(dim=1))
+                mask.scatter_(1, change_dim, True)
 
             if mask.sum() > 0:
                 x[mask] = self.config.vocab_size - 1
                 denoiser_logits = denoiser(x, current_t, class_labels)
-
                 masked_logits = denoiser_logits[mask]
 
-                masked_logits = masked_logits / temperature
+                if idx == len(time_steps) - 1:
+                    masked_logits = masked_logits / 0.01
+                else:
+                    masked_logits = masked_logits / 1.0
 
                 probs = F.softmax(masked_logits, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
                 x[mask] = next_tokens
+
+            if infer_time_from_planner and t < 0.01:
+                break
 
         return x
 

@@ -1,25 +1,23 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from dataclasses import dataclass
-import math
-import inspect
-import click
-import os
-import wandb
 import json
+import os
+
+import click
+import numpy as np
+import torch
+import torch.distributed as dist
 from safetensors.torch import safe_open
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+
+import wandb
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from model import DDPDModel, DDPDConfig, configure_optimizers, print0
 from PIL import Image
 
+from model import DDPDConfig, DDPDModel, configure_optimizers, print0
 
 MASK_IDX = 0
 
@@ -75,8 +73,8 @@ class ImageTokenDataset(Dataset):
 class MNISTTokenDataset(Dataset):
     def __init__(self, debug=False):
         print("Initializing MNISTTokenDataset")
-        from torchvision.datasets import MNIST
         from torchvision import transforms
+        from torchvision.datasets import MNIST
 
         transform = transforms.Compose(
             [
@@ -127,8 +125,6 @@ def train_step(
     batch,
     planner,
     denoiser,
-    planner_optimizer,
-    denoiser_optimizer,
     grad_accumulation_steps,
 ):
     device = "cuda"
@@ -194,35 +190,51 @@ def get_lr_scheduler(optimizer, warmup_iters, lr_decay_iters, max_iters):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def log_samples(planner, denoiser, device, sequence_length, num_samples=4):
+DECODER_PATH = "/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit"
+
+
+def log_samples(planner, denoiser, device, sequence_length, num_samples=4, mnist=False):
     planner.eval()
     denoiser.eval()
     with torch.no_grad():
         # Sample random class labels for visualization
-        class_labels = torch.randint(
-            0, planner.module.config.num_classes, (num_samples,), device=device
-        )
+        if not mnist:
+            class_labels = torch.tensor([1, 9, 94, 299], device=device)
+        else:
+            class_labels = torch.tensor([0, 1, 2, 3], device=device)
         samples = planner.module.sample(
             denoiser.module,
             class_labels=class_labels,
             batch_size=num_samples,
             sequence_length=sequence_length,
-            temperature=0.7,
+            temperature=1.0,
             device=device,
         )
         # Convert samples to text format
-        sample_texts = []
-        for sample, label in zip(samples, class_labels):
-            # Reshape back to 32x32 for visualization
-            sample_2d = sample.reshape(32, 32)
-            # to PIL image. make it to 1 channel
-            images = sample_2d.cpu().float().numpy() / 8  # shape : 32, 32
-            sample_pil = Image.fromarray(images, mode="L")
-            sample_texts.append(sample_pil)
+        samples_pil = []
+        if mnist:
+            for sample, label in zip(samples, class_labels):
+                # Reshape back to 32x32 for visualization
+                sample_2d = sample.reshape(32, 32)
+                # to PIL image. make it to 1 channel
+                image = sample_2d.cpu().float().numpy() / 8  # shape : 32, 32
+                image = Image.fromarray(image, mode="L")
+                samples_pil.append(image)
+        else:
+            decoder = torch.jit.load(DECODER_PATH).to(device)
+            tokens = samples.reshape(-1, 32, 32)
+            with torch.no_grad():
+                decoded_images = decoder(tokens)
+
+            for image in decoded_images:
+                image = (image.clamp(-1, 1) + 1) * 127.5
+                image = image.permute(1, 2, 0).float().cpu().numpy().astype(np.uint8)
+                image = Image.fromarray(image)
+                samples_pil.append(image)
 
     planner.train()
     denoiser.train()
-    return sample_texts
+    return samples_pil
 
 
 @click.command()
@@ -377,8 +389,6 @@ def train(
                     batch,
                     planner,
                     denoiser,
-                    planner_optimizer,
-                    denoiser_optimizer,
                     grad_accumulation_steps,
                 )
             )
@@ -419,7 +429,7 @@ def train(
 
         if iter_num % save_interval == 0 and local_rank == 0:
             sample_pil_images = log_samples(
-                planner, denoiser, device, 1024
+                planner, denoiser, device, 1024, mnist=mnist
             )  # 32x32 = 1024 tokens
             wandb.log(
                 {
