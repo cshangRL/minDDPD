@@ -136,7 +136,6 @@ class Block(nn.Module):
             self.chunked_fc.weight, mean=0.0, std=0.02 / math.sqrt(config.n_embd)
         )
 
-    @torch.compile(mode="reduce-overhead")
     def forward(self, x, freq=None, context=None):
         B, T, C = x.size()
         H = self.n_head
@@ -216,9 +215,9 @@ class DDPDModel(nn.Module):
         )
 
         for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
+            if pn.endswith("proj.weight"):
                 torch.nn.init.normal_(
-                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
+                    p, mean=0.0, std=0.002 / math.sqrt(2 * config.n_layer)
                 )
 
         # init head zero
@@ -235,6 +234,7 @@ class DDPDModel(nn.Module):
             time_emb = self._get_time_embedding(time * 1000, self.config.n_embd)
             cond = torch.cat([class_emb, time_emb.unsqueeze(1)], dim=1)
         else:
+            # planner does not need time embedding
             cond = class_emb
 
         freq = self.rotary(None, height_width=(32, 32))

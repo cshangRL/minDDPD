@@ -3,8 +3,8 @@ export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 torchrun --nproc_per_node=6 \
     train_ddpd.py \
     --batch-size=32 \
-    --planner-lr=0.3 \
-    --denoiser-lr=0.3 \
+    --planner-lr=0.1 \
+    --denoiser-lr=0.1 \
     --weight-decay=0.01 \
     --max-iters=100000 \
     --warmup-iters=50 \

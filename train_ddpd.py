@@ -326,8 +326,8 @@ def train(
         vocab_size=int(2**16) + 1,  # ImageNet tokens + 1 for mask.
         block_size=1024,  # 32x32 image tokens
         n_layer=14,
-        n_head=8,
-        n_embd=1024,
+        n_head=6,
+        n_embd=768,
     )
 
     if mnist:
@@ -368,6 +368,8 @@ def train(
     iter_num = 0
     train_iter = iter(train_dataloader)
 
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
     while iter_num < max_iters:
         planner.train()
         denoiser.train()
@@ -384,14 +386,15 @@ def train(
                 train_iter = iter(train_dataloader)
                 batch = next(train_iter)
 
-            losses.append(
-                train_step(
-                    batch,
-                    planner,
-                    denoiser,
-                    grad_accumulation_steps,
+            with ctx:
+                losses.append(
+                    train_step(
+                        batch,
+                        planner,
+                        denoiser,
+                        grad_accumulation_steps,
+                    )
                 )
-            )
 
         # Gradient clipping
         if grad_clip != 0.0:
