@@ -63,7 +63,7 @@ def save_images(images, output_dir, class_labels=None):
 )
 @click.option(
     "--decoder-path",
-    default="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit",
+    default="./tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit",
     help="Path to the JIT decoder model",
 )
 @click.option("--num-samples", default=4, help="Number of samples to generate")

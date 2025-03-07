@@ -1,6 +1,9 @@
 import json
 import os
 
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import click
 import numpy as np
 import torch
@@ -25,7 +28,7 @@ MASK_IDX = 0
 class ImageTokenDataset(Dataset):
     def __init__(
         self,
-        safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors",
+        safetensor_path="./tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors",
         debug=False,
     ):
         print(f"Initializing ImageTokenDataset with path: {safetensor_path}")
@@ -190,7 +193,7 @@ def get_lr_scheduler(optimizer, warmup_iters, lr_decay_iters, max_iters):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-DECODER_PATH = "/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit"
+DECODER_PATH = "./tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit"
 
 
 def log_samples(planner, denoiser, device, sequence_length, num_samples=4, mnist=False):
@@ -306,7 +309,7 @@ def train(
         train_dataset = MNISTTokenDataset(debug=True)
     else:
         train_dataset = ImageTokenDataset(
-            safetensor_path="/home/ubuntu/simo/nano-diffusion-speedrun/tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors"
+            safetensor_path="./tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors"
         )
     print(f"Rank {local_rank}: Dataset created successfully")
 
