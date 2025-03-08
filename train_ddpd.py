@@ -403,7 +403,7 @@ def train():
                 }
             )
 
-        if iter_num % 1000 == 999:
+        if iter_num % 1000 == (10*save_interval - 1) or iter_num == (max_iters - 1):
             checkpoint = {
                 "planner_state_dict": planner.state_dict(),
                 "denoiser_state_dict": denoiser.state_dict(),
