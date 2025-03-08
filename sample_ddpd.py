@@ -1,6 +1,5 @@
 import os
 
-import click
 import numpy as np
 import torch
 import torch.jit as jit
@@ -10,7 +9,7 @@ from train_ddpd import DDPDConfig, DDPDModel
 
 
 def load_models(checkpoint_path, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = DDPDConfig(**checkpoint["config"]["planner_config"].__dict__)
 
     planner = DDPDModel(config, model_type="planner").to(device)
@@ -56,39 +55,17 @@ def save_images(images, output_dir, class_labels=None):
 
         img.save(os.path.join(output_dir, filename))
 
-
-@click.command()
-@click.option(
-    "--checkpoint", required=True, help="Path to the trained model checkpoint"
-)
-@click.option(
-    "--decoder-path",
-    default="./tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit",
-    help="Path to the JIT decoder model",
-)
-@click.option("--num-samples", default=4, help="Number of samples to generate")
-@click.option("--temperature", default=1.0, help="Sampling temperature")
-@click.option("--top-k", default=None, type=int, help="Top-k sampling parameter")
-@click.option(
-    "--output-dir", default="samples", help="Directory to save generated samples"
-)
-@click.option(
-    "--class-label",
-    default="726,917,13,939",
-    type=str,
-    help="Specific class label to generate (optional)",
-)
-@click.option("--device", default="cuda", help="Device to run generation on")
 def sample(
-    checkpoint,
-    decoder_path,
-    num_samples,
-    temperature,
-    top_k,
-    output_dir,
-    class_label,
-    device,
 ):
+    checkpoint = "./checkpoints/checkpoint_iter_1000.pt" 
+    decoder_path ="./tokenize_dataset/pretrained_ckpts/Cosmos-Tokenizer-DI8x8/decoder.jit" #, help="Path to the JIT decoder model"
+    num_samples=1  # help="Number of samples to generate")
+    temperature=0.8 # help="Sampling temperature")
+    top_k = None # default=None, type=int, help="Top-k sampling parameter")
+    output_dir ="samples" #, help="Directory to save generated samples" 
+    class_label ="726,917,13,939" #"Specific class label to generate (optional)",
+    device = "mps"
+
     device = torch.device(device)
 
     # Load models

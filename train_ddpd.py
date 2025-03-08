@@ -212,6 +212,21 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4, mnist
     denoiser.train()
     return samples_pil
 
+def load_models(checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = DDPDConfig(**checkpoint["config"]["planner_config"].__dict__)
+
+    planner = DDPDModel(config, model_type="planner").to(device)
+    denoiser = DDPDModel(config, model_type="denoiser").to(device)
+
+    planner.load_state_dict(checkpoint["planner_state_dict"])
+    denoiser.load_state_dict(checkpoint["denoiser_state_dict"])
+
+    planner.eval()
+    denoiser.eval()
+
+    return planner, denoiser
+
 def train():
     # parameeters
     batch_size=32 #, help="Batch size per GPU")
@@ -222,7 +237,7 @@ def train():
     warmup_iters=100 #, help="Warmup iterations")
     lr_decay_iters=2000 #, help="LR decay iterations")
     grad_clip=1.0 #, help="Gradient clipping")
-    grad_accumulation_steps=1 #, help="Gradient accumulation steps"
+    grad_accumulation_steps=2 #, help="Gradient accumulation steps"
     log_interval=10 #, help="Log interval")
     save_interval=100 #, help="Save interval")
     wandb_project="ddpd" #, help="Weights & Biases project name")
@@ -230,6 +245,8 @@ def train():
     wandb_name=None #, help="Weights & Biases run name")
     mnist=True #, help="Use MNIST dataset")
     ckpt_dir="checkpoints" #, help="Checkpoint directory")
+
+    checkpoint = "./checkpoints/checkpoint_iter_1000.pt" 
 
     device = get_device()
     set_device(device)
@@ -285,6 +302,11 @@ def train():
     denoiser = DDPDModel(config, model_type="denoiser").to(device)
     print(f"Models created successfully")
 
+    if os.path.exists(checkpoint):
+        print("Loading models...")
+        planner, denoiser = load_models(checkpoint, device)
+
+
     # planner = torch.compile(planner, mode="reduce-overhead")
     # denoiser = torch.compile(denoiser, mode="reduce-overhead")
 
@@ -321,7 +343,6 @@ def train():
             try:
                 batch = next(train_iter)
             except StopIteration:
-                train_sampler.set_epoch(iter_num)
                 train_iter = iter(train_dataloader)
                 batch = next(train_iter)
 
@@ -382,23 +403,23 @@ def train():
                 }
             )
 
-            if iter_num % (10*save_interval) == 0:
-                checkpoint = {
-                    "planner_state_dict": planner.state_dict(),
-                    "denoiser_state_dict": denoiser.state_dict(),
-                    "planner_optimizer": planner_optimizer.state_dict(),
-                    "denoiser_optimizer": denoiser_optimizer.state_dict(),
-                    "planner_scheduler": planner_scheduler.state_dict(),
-                    "denoiser_scheduler": denoiser_scheduler.state_dict(),
-                    "config": {
-                        "planner_config": planner.config,
-                        "denoiser_config": denoiser.config,
-                    },
-                }
-                save_path = f"{ckpt_dir}/checkpoint_iter_{iter_num}.pt"
-                os.makedirs(ckpt_dir, exist_ok=True)
-                torch.save(checkpoint, save_path)
-                print(f"Checkpoint saved to {save_path}")
+        if iter_num % 1000 == 999:
+            checkpoint = {
+                "planner_state_dict": planner.state_dict(),
+                "denoiser_state_dict": denoiser.state_dict(),
+                "planner_optimizer": planner_optimizer.state_dict(),
+                "denoiser_optimizer": denoiser_optimizer.state_dict(),
+                "planner_scheduler": planner_scheduler.state_dict(),
+                "denoiser_scheduler": denoiser_scheduler.state_dict(),
+                "config": {
+                    "planner_config": planner.config,
+                    "denoiser_config": denoiser.config,
+                },
+            }
+            save_path = f"{ckpt_dir}/checkpoint_iter_{iter_num}.pt"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(checkpoint, save_path)
+            print(f"Checkpoint saved to {save_path}")
 
         iter_num += 1
     
