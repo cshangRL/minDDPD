@@ -1,29 +1,17 @@
 import json
 import os
 
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-import click
 import numpy as np
 import torch
-import torch.distributed as dist
 from safetensors.torch import safe_open
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-
-import wandb
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
 from PIL import Image
 
-from model import DDPDConfig, DDPDModel, configure_optimizers, print0
+from model import DDPDConfig, DDPDModel, configure_optimizers
+import wandb
 
 MASK_IDX = 0
-
 
 class ImageTokenDataset(Dataset):
     def __init__(
@@ -83,7 +71,7 @@ class MNISTTokenDataset(Dataset):
             [
                 transforms.ToTensor(),
                 transforms.Resize((32, 32)),  # Resize to 8x8 like the ImageNet dataset
-                transforms.Lambda(lambda x: (x * 7.0).long()),  # Scale to 16-bit range
+                transforms.Lambda(self.scale_to_int),  # Scale to 16-bit range
             ]
         )
 
@@ -92,6 +80,9 @@ class MNISTTokenDataset(Dataset):
         )
         self.total_samples = len(self.mnist)
         print(f"Total samples: {self.total_samples}")
+
+    def scale_to_int(self, x):  # Named function, picklable
+        return (x * 7.0).long()
 
     def __len__(self):
         return int(self.total_samples)
@@ -106,23 +97,23 @@ class MNISTTokenDataset(Dataset):
             print(f"Error in __getitem__ for idx {idx}: {e}")
             raise
 
+def get_device():
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.backends.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
-def setup_distributed():
-    if dist.is_initialized():
-        return
+    return device
 
-    if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = "0"
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
+def set_device(device):
+    if torch.backends.mps.is_available():
+        torch.device("mps")
+    elif torch.backends.cuda.is_available():
+        torch.cuda.set_device(device)
+    else:
+        torch.cpu.set_device(device)
 
 def train_step(
     batch,
@@ -130,7 +121,8 @@ def train_step(
     denoiser,
     grad_accumulation_steps,
 ):
-    device = "cuda"
+    device = get_device()
+
     indices, labels = batch
     indices = indices.to(device)
     labels = labels.to(device)
@@ -139,12 +131,8 @@ def train_step(
     # Create binary mask based on timestep t
     mask = torch.bernoulli(t.unsqueeze(1).expand(-1, indices.shape[1])).bool()
 
-    # print0(f"mask shape: {mask.shape}, mask: {mask[:3, :3]}")
-
     # Create corrupted version by cloning original indices
     input_indices = indices.clone()
-    # corrupted_as_null = indices.clone()
-    # corrupted_as_null[mask] = MASK_IDX
 
     # Only corrupt tokens where mask is True
     # Sample random tokens from vocab range for corrupted positions
@@ -163,7 +151,6 @@ def train_step(
         where_one = (planner_logits > 0).float()
         where_zero = (planner_logits < 0).float()
         acc = (where_one * mask.float() + where_zero * (1 - mask.float())).mean()
-        print0(f"Planner accuracy: {acc:.4f}")
 
     denoiser_logits, denoiser_loss = denoiser(
         corrupted_as_null, t, labels, targets=indices, mask=mask
@@ -175,7 +162,6 @@ def train_step(
         denoiser_at_mask = denoiser_logits[mask]
         indices_at_mask = indices[mask]
         acc = (denoiser_at_mask.argmax(dim=-1) == indices_at_mask.long()).float().mean()
-        print0(f"Denoiser accuracy: {acc:.4f}")
 
     return {
         "planner_loss": planner_loss.item() * grad_accumulation_steps,
@@ -201,12 +187,10 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4, mnist
     denoiser.eval()
     with torch.no_grad():
         # Sample random class labels for visualization
-        if not mnist:
-            class_labels = torch.tensor([1, 9, 94, 299], device=device)
-        else:
-            class_labels = torch.tensor([0, 1, 2, 3], device=device)
-        samples = planner.module.sample(
-            denoiser.module,
+        class_labels = torch.tensor([1, 9, 94, 299], device=device)
+        
+        samples = planner.sample(
+            denoiser,
             class_labels=class_labels,
             batch_size=num_samples,
             sequence_length=sequence_length,
@@ -215,79 +199,42 @@ def log_samples(planner, denoiser, device, sequence_length, num_samples=4, mnist
         )
         # Convert samples to text format
         samples_pil = []
-        if mnist:
-            for sample, label in zip(samples, class_labels):
-                # Reshape back to 32x32 for visualization
-                sample_2d = sample.reshape(32, 32)
-                # to PIL image. make it to 1 channel
-                image = sample_2d.cpu().float().numpy() / 8  # shape : 32, 32
-                image = Image.fromarray(image, mode="L")
-                samples_pil.append(image)
-        else:
-            decoder = torch.jit.load(DECODER_PATH).to(device)
-            tokens = samples.reshape(-1, 32, 32)
-            with torch.no_grad():
-                decoded_images = decoder(tokens)
-
-            for image in decoded_images:
-                image = (image.clamp(-1, 1) + 1) * 127.5
-                image = image.permute(1, 2, 0).float().cpu().numpy().astype(np.uint8)
-                image = Image.fromarray(image)
-                samples_pil.append(image)
+        
+        for sample, label in zip(samples, class_labels):
+            # Reshape back to 32x32 for visualization
+            sample_2d = sample.reshape(32, 32)
+            # to PIL image. make it to 1 channel
+            image = sample_2d.cpu().float().numpy() / 8  # shape : 32, 32
+            image = Image.fromarray(image, mode="L")
+            samples_pil.append(image)
 
     planner.train()
     denoiser.train()
     return samples_pil
 
+def train():
+    # parameeters
+    batch_size=32 #, help="Batch size per GPU")
+    planner_lr=2e-4 #, help="Planner learning rate")
+    denoiser_lr=2e-4 #, help="Denoiser learning rate")
+    weight_decay=0.1 #, help="Weight decay")
+    max_iters=2001 #, help="Maximum iterations")
+    warmup_iters=100 #, help="Warmup iterations")
+    lr_decay_iters=2000 #, help="LR decay iterations")
+    grad_clip=1.0 #, help="Gradient clipping")
+    grad_accumulation_steps=1 #, help="Gradient accumulation steps"
+    log_interval=10 #, help="Log interval")
+    save_interval=100 #, help="Save interval")
+    wandb_project="ddpd" #, help="Weights & Biases project name")
+    wandb_entity=None #,help="Weights & Biases entity (username or team name)",
+    wandb_name=None #, help="Weights & Biases run name")
+    mnist=True #, help="Use MNIST dataset")
+    ckpt_dir="checkpoints" #, help="Checkpoint directory")
 
-@click.command()
-@click.option("--batch-size", default=16, help="Batch size per GPU")
-@click.option("--planner-lr", default=2e-4, help="Planner learning rate")
-@click.option("--denoiser-lr", default=2e-4, help="Denoiser learning rate")
-@click.option("--weight-decay", default=0.1, help="Weight decay")
-@click.option("--max-iters", default=2000, help="Maximum iterations")
-@click.option("--warmup-iters", default=100, help="Warmup iterations")
-@click.option("--lr-decay-iters", default=2000, help="LR decay iterations")
-@click.option("--grad-clip", default=1.0, help="Gradient clipping")
-@click.option(
-    "--grad-accumulation-steps", default=1, help="Gradient accumulation steps"
-)
-@click.option("--log-interval", default=100, help="Log interval")
-@click.option("--save-interval", default=1000, help="Save interval")
-@click.option("--wandb-project", default="ddpd", help="Weights & Biases project name")
-@click.option(
-    "--wandb-entity",
-    default=None,
-    help="Weights & Biases entity (username or team name)",
-)
-@click.option("--wandb-name", default=None, help="Weights & Biases run name")
-@click.option("--mnist", default=True, help="Use MNIST dataset")
-@click.option("--ckpt-dir", default="checkpoints", help="Checkpoint directory")
-def train(
-    batch_size,
-    planner_lr,
-    denoiser_lr,
-    weight_decay,
-    max_iters,
-    warmup_iters,
-    lr_decay_iters,
-    grad_clip,
-    grad_accumulation_steps,
-    log_interval,
-    save_interval,
-    wandb_project,
-    wandb_entity,
-    wandb_name,
-    mnist,
-    ckpt_dir,
-):
-    setup_distributed()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    # Initialize wandb only on rank 0
-    if local_rank == 0:
-        wandb.init(
+    device = get_device()
+    set_device(device)
+
+    wandb.init(
             project=wandb_project,
             entity=wandb_entity,
             name=wandb_name,
@@ -304,25 +251,20 @@ def train(
             },
         )
 
-    print(f"Rank {local_rank}: Creating dataset")
-    if mnist:
-        train_dataset = MNISTTokenDataset(debug=True)
-    else:
-        train_dataset = ImageTokenDataset(
-            safetensor_path="./tokenize_dataset/preprocessed_dataset/imagenet_di8x8.safetensors"
-        )
-    print(f"Rank {local_rank}: Dataset created successfully")
 
-    train_sampler = DistributedSampler(train_dataset)
+    # Initialize wandb only on rank 0
+    train_dataset = MNISTTokenDataset(debug=True)
+    print(f"Dataset created successfully")
+    
+    #train_sampler = DistributedSampler(train_dataset)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        sampler=train_sampler,
         num_workers=8,
         pin_memory=False,
         persistent_workers=True,
     )
-    print(f"Rank {local_rank}: DataLoader created successfully")
+    print(f"DataLoader created successfully")
 
     # Initialize models
     config = DDPDConfig(
@@ -333,31 +275,25 @@ def train(
         n_embd=768,
     )
 
-    if mnist:
-        config.vocab_size = 9
-        config.block_size = 1024
-        config.num_classes = 10
+    config.vocab_size = 9
+    config.block_size = 1024
+    config.num_classes = 10
 
     global MASK_IDX
     MASK_IDX = config.vocab_size - 1
-    print(f"Rank {local_rank}: MASK_IDX: {MASK_IDX}")
-    print(f"Rank {local_rank}: Creating models with config: {config}")
     planner = DDPDModel(config, model_type="planner").to(device)
     denoiser = DDPDModel(config, model_type="denoiser").to(device)
-
-    planner = DDP(planner, device_ids=[local_rank], find_unused_parameters=True)
-    denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=True)
-    print(f"Rank {local_rank}: Models created successfully")
+    print(f"Models created successfully")
 
     # planner = torch.compile(planner, mode="reduce-overhead")
     # denoiser = torch.compile(denoiser, mode="reduce-overhead")
 
     # Setup optimizers and schedulers
     planner_optimizer = configure_optimizers(
-        planner, weight_decay, planner_lr, (0.95, 0.99), "cuda"
+        planner, weight_decay, planner_lr, (0.95, 0.99), device
     )
     denoiser_optimizer = configure_optimizers(
-        denoiser, weight_decay, denoiser_lr, (0.95, 0.99), "cuda"
+        denoiser, weight_decay, denoiser_lr, (0.95, 0.99), device
     )
 
     planner_scheduler = get_lr_scheduler(
@@ -371,7 +307,7 @@ def train(
     iter_num = 0
     train_iter = iter(train_dataloader)
 
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    ctx = torch.amp.autocast(device_type=device, dtype=torch.bfloat16)
 
     while iter_num < max_iters:
         planner.train()
@@ -410,7 +346,7 @@ def train(
         planner_scheduler.step()
         denoiser_scheduler.step()
 
-        if iter_num % log_interval == 0 and local_rank == 0:
+        if iter_num % log_interval == 0:
             avg_losses = {
                 k: sum(d[k] for d in losses) / len(losses) for k in losses[0].keys()
             }
@@ -433,7 +369,7 @@ def train(
                 }
             )
 
-        if iter_num % save_interval == 0 and local_rank == 0:
+        if iter_num % save_interval == 0:
             sample_pil_images = log_samples(
                 planner, denoiser, device, 1024, mnist=mnist
             )  # 32x32 = 1024 tokens
@@ -445,29 +381,28 @@ def train(
                     ]
                 }
             )
-            checkpoint = {
-                "planner_state_dict": planner.module.state_dict(),
-                "denoiser_state_dict": denoiser.module.state_dict(),
-                "planner_optimizer": planner_optimizer.state_dict(),
-                "denoiser_optimizer": denoiser_optimizer.state_dict(),
-                "planner_scheduler": planner_scheduler.state_dict(),
-                "denoiser_scheduler": denoiser_scheduler.state_dict(),
-                "config": {
-                    "planner_config": planner.module.config,
-                    "denoiser_config": denoiser.module.config,
-                },
-            }
-            save_path = f"{ckpt_dir}/checkpoint_iter_{iter_num}.pt"
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(checkpoint, save_path)
-            print(f"Rank {local_rank}: Checkpoint saved to {save_path}")
+
+            if iter_num % (10*save_interval) == 0:
+                checkpoint = {
+                    "planner_state_dict": planner.state_dict(),
+                    "denoiser_state_dict": denoiser.state_dict(),
+                    "planner_optimizer": planner_optimizer.state_dict(),
+                    "denoiser_optimizer": denoiser_optimizer.state_dict(),
+                    "planner_scheduler": planner_scheduler.state_dict(),
+                    "denoiser_scheduler": denoiser_scheduler.state_dict(),
+                    "config": {
+                        "planner_config": planner.config,
+                        "denoiser_config": denoiser.config,
+                    },
+                }
+                save_path = f"{ckpt_dir}/checkpoint_iter_{iter_num}.pt"
+                os.makedirs(ckpt_dir, exist_ok=True)
+                torch.save(checkpoint, save_path)
+                print(f"Checkpoint saved to {save_path}")
 
         iter_num += 1
-
-    if local_rank == 0:
-        wandb.finish()
-    cleanup_distributed()
-
+    
+    wandb.finish()
 
 if __name__ == "__main__":
     train()

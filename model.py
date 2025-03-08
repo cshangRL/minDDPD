@@ -3,12 +3,8 @@ import math
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
 
 @dataclass
@@ -340,8 +336,7 @@ class DDPDModel(nn.Module):
 
 
 def print0(s):
-    if dist.get_rank() == 0:
-        print(s)
+    print(s)
 
 
 def configure_optimizers(
